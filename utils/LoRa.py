@@ -238,14 +238,14 @@ class LoRa:
         self.plot_fft_total(signal)
 
     def gen_symbol_fs(self, code_word, sf, bw, down=False, Fs=None):
-        sf = self.sf
-        bw = self.bw
+        # 파라미터 사용 (self 값 사용 안 함)
+        # sf = self.sf
+        # bw = self.bw
         # Fs = bw
         # the default sampling frequency is 1e6
         if Fs is None or Fs < 0:
             Fs = 1000000
-        # bandwidth : default(125kHz)
-        bw = bw
+        # bandwidth : use parameter value
         org_Fs = Fs
 
         # For Nyquist Theory
@@ -503,9 +503,9 @@ class BAMv3:
                 # average error for this batch
                 batch_mse = sum(batch_errors) / len(batch_errors)
                 losses.append(batch_mse)
-
-                if verbose and i % (batch_size * 10) == 0:
-                    print(f"Epoch {epoch+1}, Batch {i//batch_size+1}, MSE = {batch_mse:.6f}")
+                
+                if verbose:
+                    print(f"Epoch {epoch+1}, Batch {i//batch_size+1}/{(n_samples+batch_size-1)//batch_size}, MSE = {batch_mse:.6f}")
 
         return losses
 

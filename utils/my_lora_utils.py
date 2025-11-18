@@ -146,15 +146,20 @@ def estimate_symbol_custom(a,title,sf,fs,bw,tresshold = 0):
     """
     # if len(a) != len(down_chirp_signal):
     #     raise ValueError("Length mismatch between IQ and downchirp")
-    symbol_time = 2**sf / bw  # Symbol duration
-    # Time vector
-    t = np.arange(0, symbol_time, 1/fs)
+    
+    # ⭐ 입력 신호 길이에 맞춰 chirp 생성 (길이 불일치 방지)
+    signal_len = len(a)
+    symbol_time = signal_len / fs  # 실제 신호 길이에 맞춘 시간
+    
+    # Time vector (입력 신호와 동일한 길이)
+    t = np.arange(signal_len) / fs
+    
     # Generate Downchirp (Linear Frequency Modulation)
     f0 = -bw/2 # Start frequency
     f1 = bw/2 # End frequency
 
     # Generate Upchirp (increasing frequency)
-    up_chirp_signal = np.exp(1j * 2 * np.pi * (f0 * t + (f1 / ( symbol_time)) * t**2))
+    up_chirp_signal = np.exp(1j * 2 * np.pi * (f0 * t + (f1 / symbol_time) * t**2))
     down_chirp_signal = np.conj(up_chirp_signal)
     # 1. Dechirp: multiply with conjugate downchirp
     dechirped = a * down_chirp_signal
