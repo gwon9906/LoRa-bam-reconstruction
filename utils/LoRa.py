@@ -547,6 +547,318 @@ class MultiBAMv3:
         for bam in reversed(self.bams):
             X = bam.decompress(X)
         return X 
+
+    
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+
+class BAMv4(nn.Module):
+    """
+    BAMv4: Denoising + Compression용 단일 레이어 BAM
+    - Encoder:  x_noisy  -> z  (dim: input_dim -> latent_dim)
+    - Decoder:  z        -> x_hat (dim: latent_dim -> input_dim)
+      (decoder는 encoder weight의 transpose 사용 = BAM flavor 유지)
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        latent_dim: int,
+        activation: str = "tanh",   # "tanh" or "relu" or "none"
+        device: str = None
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+
+        # Encoder weight (latent_dim x input_dim)
+        self.encoder = nn.Linear(input_dim, latent_dim, bias=False)
+
+        # Activation
+        if activation == "tanh":
+            self.activation = torch.tanh
+        elif activation == "relu":
+            self.activation = F.relu
+        elif activation is None or activation == "none":
+            self.activation = None
+        else:
+            raise ValueError(f"Unknown activation: {activation}")
+
+        self.to(self.device)
+
+    # --------- 기본 forward / encode / decode ---------
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, input_dim)
+        return: (B, latent_dim)
+        """
+        z = self.encoder(x)
+        if self.activation is not None:
+            z = self.activation(z)
+        return z
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        decoder는 encoder weight의 transpose 사용
+        z: (B, latent_dim)
+        return: (B, input_dim)
+        """
+        W = self.encoder.weight  # (latent_dim, input_dim)
+        x_hat = torch.matmul(z, W)  # (B, input_dim)
+        if self.activation is not None:
+            x_hat = self.activation(x_hat)
+        return x_hat
+
+    def forward(self, x_noisy: torch.Tensor) -> torch.Tensor:
+        """
+        Denoising forward:
+        x_noisy -> z -> x_hat (clean 쪽으로 복원)
+        """
+        z = self.encode(x_noisy)
+        x_hat = self.decode(z)
+        return x_hat
+
+    # --------- Numpy <-> Tensor 헬퍼 ---------
+    def _to_tensor(self, x):
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x.astype(np.float32))
+        return x.to(self.device)
+
+    def reconstruct_numpy(self, x_noisy_np: np.ndarray) -> np.ndarray:
+        """
+        Numpy 입력을 받아서 numpy 결과로 반환 (배치 형태)
+        """
+        self.eval()
+        with torch.no_grad():
+            x_noisy = self._to_tensor(x_noisy_np)
+            x_hat = self.forward(x_noisy)
+            return x_hat.cpu().numpy()
+
+    def compress_numpy(self, x_np: np.ndarray) -> np.ndarray:
+        """
+        Numpy 입력 -> latent z (numpy)
+        """
+        self.eval()
+        with torch.no_grad():
+            x = self._to_tensor(x_np)
+            z = self.encode(x)
+            return z.cpu().numpy()
+
+    def decompress_numpy(self, z_np: np.ndarray) -> np.ndarray:
+        """
+        latent z (numpy) -> 복원 x_hat (numpy)
+        """
+        self.eval()
+        with torch.no_grad():
+            z = self._to_tensor(z_np)
+            x_hat = self.decode(z)
+            return x_hat.cpu().numpy()
+
+    # --------- Denoising 학습용 메서드 ---------
+    def fit_denoise(
+        self,
+        X_noisy,
+        X_clean,
+        num_epochs: int = 10,
+        batch_size: int = 64,
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+        verbose: bool = True
+    ):
+        """
+        Denoising 학습:
+        - 입력:  X_noisy  (노이즈 낀 데이터)   shape: (N, input_dim)
+        - 타깃:  X_clean  (클린 데이터)       shape: (N, input_dim)
+        """
+        Xn = self._to_tensor(X_noisy)
+        Xc = self._to_tensor(X_clean)
+        assert Xn.shape == Xc.shape, "Noisy/Clean shape mismatch"
+
+        dataset = torch.utils.data.TensorDataset(Xn, Xc)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=True, drop_last=False
+        )
+
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
+
+        history = []
+
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            self.train()
+
+            for batch_noisy, batch_clean in loader:
+                optimizer.zero_grad()
+                x_hat = self.forward(batch_noisy)          # noisy -> clean 추정
+                loss = criterion(x_hat, batch_clean)
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item() * batch_noisy.size(0)
+
+            epoch_loss /= len(dataset)
+            history.append(epoch_loss)
+            if verbose:
+                print(f"[BAMv4] Epoch {epoch+1}/{num_epochs} | MSE = {epoch_loss:.6f}")
+
+        return history
+
+
+class MultiBAMv4(nn.Module):
+    """
+    MultiBAMv4: 여러 층을 쌓은 BAM식 Denoising Autoencoder
+    - encoder_layers: Linear(input_dim -> h1 -> h2 -> ... -> hL)
+    - decoder는 각 layer weight의 transpose를 역순으로 사용
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: list,       # 예: [2048, 512, 128]  (마지막 128이 compressed dim)
+        activation: str = "tanh",
+        device: str = None
+    ):
+        super().__init__()
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+
+        self.input_dim = input_dim
+        self.hidden_dims = hidden_dims
+
+        # Encoder 레이어 정의
+        dims = [input_dim] + hidden_dims
+        self.encoder_layers = nn.ModuleList()
+        for in_d, out_d in zip(dims[:-1], dims[1:]):
+            layer = nn.Linear(in_d, out_d, bias=False)
+            self.encoder_layers.append(layer)
+
+        # Activation
+        if activation == "tanh":
+            self.activation = torch.tanh
+        elif activation == "relu":
+            self.activation = F.relu
+        elif activation is None or activation == "none":
+            self.activation = None
+        else:
+            raise ValueError(f"Unknown activation: {activation}")
+
+        self.to(self.device)
+
+    # ---------- Forward helpers ----------
+    def _act(self, x):
+        return self.activation(x) if self.activation is not None else x
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, input_dim)
+        return: (B, last_hidden_dim)
+        """
+        h = x
+        for layer in self.encoder_layers:
+            h = self._act(layer(h))
+        return h
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        z: (B, last_hidden_dim)
+        decoder는 encoder weight의 transpose를 역순으로 사용
+        """
+        h = z
+        for layer in reversed(self.encoder_layers):
+            W = layer.weight  # (out_dim, in_dim)
+            h = torch.matmul(h, W)  # (B, in_dim)
+            h = self._act(h)
+        return h
+
+    def forward(self, x_noisy: torch.Tensor) -> torch.Tensor:
+        z = self.encode(x_noisy)
+        x_hat = self.decode(z)
+        return x_hat
+
+    # ---------- Numpy helpers ----------
+    def _to_tensor(self, x):
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x.astype(np.float32))
+        return x.to(self.device)
+
+    def reconstruct_numpy(self, x_noisy_np: np.ndarray) -> np.ndarray:
+        self.eval()
+        with torch.no_grad():
+            x_noisy = self._to_tensor(x_noisy_np)
+            x_hat = self.forward(x_noisy)
+            return x_hat.cpu().numpy()
+
+    def compress_numpy(self, x_np: np.ndarray) -> np.ndarray:
+        self.eval()
+        with torch.no_grad():
+            x = self._to_tensor(x_np)
+            z = self.encode(x)
+            return z.cpu().numpy()
+
+    def decompress_numpy(self, z_np: np.ndarray) -> np.ndarray:
+        self.eval()
+        with torch.no_grad():
+            z = self._to_tensor(z_np)
+            x_hat = self.decode(z)
+            return x_hat.cpu().numpy()
+
+    # ---------- Denoising 학습 ----------
+    def fit_denoise(
+        self,
+        X_noisy,
+        X_clean,
+        num_epochs: int = 10,
+        batch_size: int = 64,
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+        verbose: bool = True
+    ):
+        """
+        X_noisy: (N, input_dim)
+        X_clean: (N, input_dim)
+        """
+        Xn = self._to_tensor(X_noisy)
+        Xc = self._to_tensor(X_clean)
+        assert Xn.shape == Xc.shape, "Noisy/Clean shape mismatch"
+
+        dataset = torch.utils.data.TensorDataset(Xn, Xc)
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=True, drop_last=False
+        )
+
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
+
+        history = []
+
+        for epoch in range(num_epochs):
+            self.train()
+            epoch_loss = 0.0
+
+            for batch_noisy, batch_clean in loader:
+                optimizer.zero_grad()
+                x_hat = self.forward(batch_noisy)
+                loss = criterion(x_hat, batch_clean)
+                loss.backward()
+                optimizer.step()
+
+                epoch_loss += loss.item() * batch_noisy.size(0)
+
+            epoch_loss /= len(dataset)
+            history.append(epoch_loss)
+
+            if verbose:
+                print(f"[MultiBAMv4] Epoch {epoch+1}/{num_epochs} | MSE = {epoch_loss:.6f}")
+
+        return history
     
           
 # # --------------------------
