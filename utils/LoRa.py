@@ -1072,3 +1072,151 @@ class MultiBAMv4(nn.Module):
     # re_hat = pred[0] * scale
     # im_hat = pred[1] * scale
     # # re_hat/im_hat are your reconstructed spectrogram channels
+
+
+# ========================================
+#  BAMv5: Supervised Learning Version
+# ========================================
+
+class BAMv5:
+    """
+    BAMv5: Supervised learning을 위한 BAM
+    - X_input과 X_target을 분리해서 학습
+    - PyTorch 기반, GPU 가속
+    """
+    def __init__(self, input_dim, output_dim, eta=1e-4, device=None):
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.eta = eta
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.W = torch.empty(output_dim, input_dim, device=self.device)
+        torch.nn.init.uniform_(self.W, -0.01, 0.01)
+
+    def _output_function(self, Wx):
+        return Wx  # Linear activation
+
+    def train_supervised(self, X_input, X_target, num_epochs=1, batch_size=32, verbose=True):
+        """
+        Supervised training: X_input → compress → decompress → X_target
+        
+        Parameters:
+        -----------
+        X_input : np.ndarray
+            입력 데이터 (noisy)
+        X_target : np.ndarray
+            타겟 데이터 (clean)
+        """
+        X_input = torch.tensor(X_input, dtype=torch.float32, device=self.device)
+        X_target = torch.tensor(X_target, dtype=torch.float32, device=self.device)
+        n_samples = X_input.shape[0]
+        losses = []
+
+        for epoch in range(num_epochs):
+            perm = torch.randperm(n_samples, device=self.device)
+            X_input_shuffled = X_input[perm]
+            X_target_shuffled = X_target[perm]
+
+            for i in range(0, n_samples, batch_size):
+                batch_input = X_input_shuffled[i:i+batch_size]
+                batch_target = X_target_shuffled[i:i+batch_size]
+                batch_errors = []
+
+                for x_in, x_tgt in zip(batch_input, batch_target):
+                    x_in = x_in.view(1, -1)
+                    x_tgt = x_tgt.view(1, -1)
+                    
+                    # Forward: input → compressed → reconstructed
+                    y = self._output_function(self.W @ x_in.T)
+                    x_reconstructed = self._output_function(self.W.T @ y)
+
+                    # Error: target - reconstructed
+                    error = x_tgt - x_reconstructed.T
+                    batch_errors.append(torch.mean(error ** 2).item())
+
+                    # Update weights
+                    self.W += self.eta * (y @ error)
+
+                    if torch.isnan(self.W).any():
+                        raise ValueError("NaN detected in weights!")
+
+                batch_mse = sum(batch_errors) / len(batch_errors)
+                losses.append(batch_mse)
+                
+                if verbose:
+                    print(f"Epoch {epoch+1}, Batch {i//batch_size+1}/{(n_samples+batch_size-1)//batch_size}, MSE = {batch_mse:.6f}")
+
+        return losses
+
+    def compress(self, X):
+        X = torch.tensor(X, dtype=torch.float32, device=self.device)
+        y = self._output_function(self.W @ X.T).T
+        return y.detach().cpu().numpy()
+
+    def decompress(self, compressed_X):
+        Y = torch.tensor(compressed_X, dtype=torch.float32, device=self.device)
+        X_reconstructed = self._output_function(self.W.T @ Y.T).T
+        return X_reconstructed.detach().cpu().numpy()
+
+
+class MultiBAMv5:
+    """
+    MultiBAMv5: Supervised learning을 위한 Multi-layer BAM
+    """
+    def __init__(self, layers_dims, eta=1e-4, device=None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.bams = [
+            BAMv5(layers_dims[i], layers_dims[i + 1], eta, self.device)
+            for i in range(len(layers_dims) - 1)
+        ]
+
+    def train_supervised(self, X_input, X_target, num_epochs=1, batch_size=32):
+        """
+        Multi-layer supervised training
+        
+        각 레이어는 자신의 차원으로 재구성하도록 학습
+        Layer i: noisy_i → compress → decompress → noisy_i (autoencoder)
+        하지만 전체 목표는 noisy → clean이 되도록
+        
+        Parameters:
+        -----------
+        X_input : np.ndarray
+            입력 데이터 (noisy)
+        X_target : np.ndarray
+            타겟 데이터 (clean)
+        """
+        all_losses = []
+
+        # Train each layer
+        X_current_input = X_input
+        X_current_target = X_target
+        
+        for i, bam in enumerate(self.bams):
+            print(f"\n--- Training Layer {i+1}/{len(self.bams)} ---")
+            print(f"   Input shape: {X_current_input.shape}")
+            print(f"   Target shape: {X_current_target.shape}")
+            
+            # 각 BAM은 input_dim → output_dim → input_dim으로 작동
+            # input과 target이 같은 차원이어야 함!
+            losses = bam.train_supervised(
+                X_current_input, X_current_target, 
+                num_epochs=num_epochs, batch_size=batch_size
+            )
+            all_losses.append(losses)
+            
+            # 다음 레이어를 위해 둘 다 압축
+            # 중요: 학습이 끝난 후 압축해야 함!
+            X_current_input = bam.compress(X_current_input)
+            X_current_target = bam.compress(X_current_target)
+
+        return all_losses
+
+    def compress(self, X):
+        for bam in self.bams:
+            X = bam.compress(X)
+        return X
+
+    def decompress(self, X):
+        for bam in reversed(self.bams):
+            X = bam.decompress(X)
+        return X

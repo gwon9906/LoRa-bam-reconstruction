@@ -88,110 +88,84 @@ def generate_lora_chirp(symbol, t):
     return np.array(final, dtype=np.complex128)
     #return np.exp(1j * 2 * np.pi * ((f0 + symbol_freq_shift) * t + (bw / (2 * symbol_time)) * t**2))
 
-def estimate_symbol(a,title,tresshold = 0):
-    from scipy.signal import windows
+def estimate_symbol(a, title, tresshold=0):
     """
-    Estimate LoRa symbol from oversampled IQ samples (e.g. 4096 samples for SF=9).
+    Estimate LoRa symbol from IQ samples using dechirp + FFT.
+    Uses global variables: down_chirp_signal, sf
     
     Parameters:
-        iq: np.ndarray — complex I/Q samples (length = 2^sf * oversample)
-        downchirp: np.ndarray — reference downchirp (same length as iq)
-        sf: int — spreading factor (default 9)
+        a: np.ndarray — complex I/Q samples (must match down_chirp_signal length)
+        title: str — debug title (unused, kept for compatibility)
+        tresshold: float — threshold for peak detection (unused)
     
     Returns:
-        int — estimated symbol index (0 to 2^sf - 1)
+        symbol: int — estimated symbol index (0 to 2^sf - 1)
+        peak_power: float — peak power value at the detected symbol
     """
     if len(a) != len(down_chirp_signal):
-        raise ValueError("Length mismatch between IQ and downchirp")
+        raise ValueError(f"Length mismatch: IQ={len(a)}, downchirp={len(down_chirp_signal)}")
 
-    # 1. Dechirp: multiply with conjugate downchirp
+    # Dechirp: multiply with conjugate downchirp
     dechirped = a * down_chirp_signal
 
-    # # Step 2: Optional windowing to reduce sidelobes
-    # windowed = dechirped * windows.hamming(len(dechirped))
+    # FFT (no shift for standard LoRa processing)
+    spectrum = np.fft.fft(dechirped)
+    power = np.abs(spectrum)
+    
+    # Extract first 2^sf bins (LoRa symbol range)
+    bins = 2 ** sf
+    valid_power = power[:bins]
+    
+    # Find peak
+    symbol = np.argmax(valid_power)
+    peak_power = valid_power[symbol]
+    
+    return symbol, peak_power
 
-    # Step 3: FFT
-    spectrum = np.fft.fftshift(np.fft.fft(dechirped))
-    power = np.abs(spectrum) ** 2
-    max_index = np.argmax(power)
-    
-    # Step 4: Extract only the middle 512 bins (LoRa bandwidth region)
-    fft_len = len(power)
-    center = fft_len // 2
-   
-    bins = 2 ** sf  # 512 bins
-    upper_freq = power[center : center + bins]
-    
-    lower_freq = power[center - bins: center]
-    all_freq = power[center - bins : center + bins]
-    
-    combine = upper_freq + lower_freq
-    # Step 5: Find peak (max bin)
-    symbol = np.argmax(combine)
-    
-    return symbol,max_index
-
-def estimate_symbol_custom(a,title,sf,fs,bw,tresshold = 0):
-    from scipy.signal import windows
+def estimate_symbol_custom(a, title, sf, fs, bw, threshold=0):
     """
-    Estimate LoRa symbol from oversampled IQ samples (e.g. 4096 samples for SF=9).
+    Estimate LoRa symbol from IQ samples using dechirp + FFT
     
     Parameters:
-        iq: np.ndarray — complex I/Q samples (length = 2^sf * oversample)
-        downchirp: np.ndarray — reference downchirp (same length as iq)
-        sf: int — spreading factor (default 9)
+        a: complex IQ signal
+        title: debug title (unused, can remove)
+        sf: spreading factor
+        fs: sampling frequency
+        bw: bandwidth
+        threshold: threshold for peak detection (unused)
     
     Returns:
-        int — estimated symbol index (0 to 2^sf - 1)
+        symbol: estimated symbol (0 to 2^sf - 1)
+        peak_power: peak power value
     """
-    # if len(a) != len(down_chirp_signal):
-    #     raise ValueError("Length mismatch between IQ and downchirp")
-    
-    # ⭐ 입력 신호 길이에 맞춰 chirp 생성 (길이 불일치 방지)
     signal_len = len(a)
-    symbol_time = signal_len / fs  # 실제 신호 길이에 맞춘 시간
-    
-    # Time vector (입력 신호와 동일한 길이)
     t = np.arange(signal_len) / fs
     
-    # Generate Downchirp (Linear Frequency Modulation)
-    f0 = -bw/2 # Start frequency
-    f1 = bw/2 # End frequency
-
-    # Generate Upchirp (increasing frequency)
-    up_chirp_signal = np.exp(1j * 2 * np.pi * (f0 * t + (f1 / symbol_time) * t**2))
+    # 🔧 수정: 올바른 Linear Chirp 생성
+    f0 = -bw / 2
+    f1 = bw / 2
+    symbol_time = signal_len / fs
+    k = (f1 - f0) / symbol_time  # chirp rate
+    
+    # Upchirp: f(t) = f0 + k*t
+    phase = 2 * np.pi * (f0 * t + (k / 2) * t**2)
+    up_chirp_signal = np.exp(1j * phase)
     down_chirp_signal = np.conj(up_chirp_signal)
-    # 1. Dechirp: multiply with conjugate downchirp
+    
+    # Dechirp
     dechirped = a * down_chirp_signal
-
-    # # Step 2: Optional windowing to reduce sidelobes
-    # windowed = dechirped * windows.hamming(len(dechirped))
-
-    # Step 3: FFT
-    spectrum = np.fft.fftshift(np.fft.fft(dechirped))
-    # power = np.abs(spectrum) ** 2
+    
+    # FFT (shift 없이!)
+    spectrum = np.fft.fft(dechirped)
     power = np.abs(spectrum)
-    max_index = np.argmax(power)
     
-    # Step 4: Extract only the middle 512 bins (LoRa bandwidth region)
-    fft_len = len(power)
-    center = fft_len // 2
-   
-    bins = 2 ** sf  # 512 bins
-    upper_freq = power[center : center + bins]
+    # 🔧 수정: 처음 2^sf bins에서 peak 찾기
+    bins = 2 ** sf
+    valid_power = power[:bins]
+    symbol = np.argmax(valid_power)
+    peak_power = valid_power[symbol]
     
-    lower_freq = power[center - bins: center]
-    all_freq = power[center - bins : center + bins]
-
-    combine = upper_freq + lower_freq
-    # Step 5: Find peak (max bin)
-    print(np.max(upper_freq))
-    print(np.max(lower_freq))
-    print(np.max(combine))
-    
-    symbol = np.argmax(combine)
-    
-    return symbol,max_index
+    return symbol, peak_power
 
 def awgn(signal, snr_db):
     """Additive White Gaussian Noise (AWGN) to a signal."""
@@ -1021,7 +995,7 @@ def apply_cfo(x, Fs, freq_offset_hz):
 # example: linewidth 100 Hz
 # x_pn = apply_phase_noise(x, Fs=1e6, linewidth_hz=100)
 def apply_phase_noise(x, Fs, linewidth_hz):
-    # approximate phase noise as Wiener process with PSD ~ linewidth
+    # approximate phase noise as Wiener process with PSD ~ linewidth    
     n = len(x)
     dt = 1.0 / Fs
     sigma = np.sqrt(2 * np.pi * linewidth_hz * dt)  # per-sample increment std
