@@ -518,6 +518,24 @@ class BAMv3:
         Y = torch.tensor(compressed_X, dtype=torch.float32, device=self.device)
         X_reconstructed = self._output_function(self.W.T @ Y.T).T
         return X_reconstructed.detach().cpu().numpy()
+
+    def iterative_reconstruction(self, X, iterations=3):
+        """
+        BAM의 핵심: 공명(Resonance) 효과를 이용한 반복 복원
+        신호를 여러 번 통과시켜 노이즈를 점진적으로 깎아냄
+        """
+        current_X = X.copy() # 혹은 torch.clone()
+        
+        for i in range(iterations):
+            # 압축 (Encode)
+            compressed = self.compress(current_X)
+            # 복원 (Decode)
+            reconstructed = self.decompress(compressed)
+            
+            # 다음 단계 입력으로 사용 (Feedback)
+            current_X = reconstructed
+            
+        return current_X
     
 class MultiBAMv3:
     def __init__(self, layers_dims, eta=1e-4, device=None):
@@ -547,6 +565,24 @@ class MultiBAMv3:
         for bam in reversed(self.bams):
             X = bam.decompress(X)
         return X 
+
+    def iterative_reconstruction(self, X, iterations=3):
+        """
+        BAM의 핵심: 공명(Resonance) 효과를 이용한 반복 복원
+        신호를 여러 번 통과시켜 노이즈를 점진적으로 깎아냄
+        """
+        current_X = X.copy() # 혹은 torch.clone()
+        
+        for i in range(iterations):
+            # 압축 (Encode)
+            compressed = self.compress(current_X)
+            # 복원 (Decode)
+            reconstructed = self.decompress(compressed)
+            
+            # 다음 단계 입력으로 사용 (Feedback)
+            current_X = reconstructed
+            
+        return current_X
 
     
 import torch
