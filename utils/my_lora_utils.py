@@ -157,7 +157,7 @@ def estimate_symbol_custom(a, title, sf, fs, bw, threshold=0):
     
     # FFT (shift 없이!)
     spectrum = np.fft.fft(dechirped)
-    power = np.abs(spectrum)
+    power = np.abs(spectrum) ** 2
     
     # 🔧 수정: 처음 2^sf bins에서 peak 찾기
     bins = 2 ** sf
