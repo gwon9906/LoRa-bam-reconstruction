@@ -10,50 +10,58 @@ from scipy import signal
 import torch
 
 class LoRa:
-    def __init__(self, sf, bw):
+    def __init__(self, sf, bw, OSF=4):
+        """
+        sf : spreading factor
+        bw : bandwidth (Hz)
+        OSF: oversampling factor (fs = bw * OSF)
+        """
         self.sf = sf
         self.bw = bw
+        self.OSF = OSF
+        self.fs = int(bw * OSF)   # ★ 전체 시스템에서 쓸 샘플링 주파수
 
     def gen_symbol(self, code_word, down=False, Fs=None):
         sf = self.sf
         bw = self.bw
-        Fs = bw
-        # the default sampling frequency is 1e6
-        if Fs is None or Fs < 0:
-            Fs = 1000000
-        # bandwidth : default(125kHz)
-        bw = bw
-        org_Fs = Fs
 
-        # For Nyquist Theory
-        if Fs < bw:
-            Fs = bw
-        
-        t = np.arange(0, 2**sf/bw, 1/Fs)
-        num_samp = Fs * 2**sf/bw
+        # ★ 기본 샘플링 주파수는 self.fs = bw * OSF
+        if Fs is None or Fs <= 0:
+            Fs = self.fs
 
-        f0 = -bw/2
-        f1 = bw/2
+        # 이론적 심볼 시간 Ts
+        Ts = (2 ** sf) / bw
 
-        chirpI = chirp(t, f0, 2**sf/bw, f1, 'linear', 0)
-        chirpQ = chirp(t, f0, 2**sf/bw, f1, 'linear', -90)
-        baseline = chirpI + 1j * chirpQ
+        # 심볼 하나에 해당하는 샘플 수
+        Ns = int(round(Ts * Fs))
 
-        if down:
-            baseline = np.conj(baseline)
-        baseline = numpy.matlib.repmat(baseline,1,2)
-        offset = round((2**sf - code_word) / 2**sf * num_samp)
-        # print(baseline[:5])
-        # print(np.shape(baseline))
+        # 시간 축
+        t = np.arange(Ns) / Fs
 
-#         symb = baseline[:, offset:(offset+int(num_samp))]
-        symb = baseline[:, (2**sf - offset):(2**sf - offset+int(num_samp))]
+        # 기준 upchirp (baseband, -BW/2 ~ +BW/2 sweep)
+        f0 = -bw / 2.0
+        f1 = +bw / 2.0
+        k = (f1 - f0) / Ts
 
-        if org_Fs != Fs:
-            overSamp = int(Fs / org_Fs)
-            symb = symb[:, ::overSamp]
+        phase = 2 * np.pi * (f0 * t + 0.5 * k * t**2)
+        up_chirp = np.exp(1j * phase)
 
-        return symb[0]
+        # 데이터 심볼 m을 주파수 쉬프트로 실어줌
+        m = int(code_word) % (2 ** sf)
+        # 톤 주파수: f_m = m/Ts
+        f_m = m / Ts
+        phase_m = 2 * np.pi * f_m * t
+        data_tone = np.exp(1j * phase_m)
+
+        if not down:
+            s = up_chirp * data_tone   # upchirp + data
+        else:
+            # downchirp = conj(upchirp) * data
+            down_chirp = np.conj(up_chirp)
+            s = down_chirp * data_tone
+
+        return s.astype(np.complex128)
+
 
     def gen_symbol_exp(self, code_word, down=False):
         sf = self.sf

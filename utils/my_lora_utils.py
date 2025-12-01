@@ -8,7 +8,7 @@ import lz4.frame
 from numpy.linalg import svd
 
 sample_rate = 1e6   # 1 MHz
-bw = 125e3          # LoRa Bandwidth (125 kHz)
+bw = 250e3          # LoRa Bandwidth (250 kHz)
 sf = 9       # Spreading Factor 
 
 symbol_time = 2**sf / bw  # Symbol duration
@@ -129,7 +129,7 @@ def estimate_symbol_custom(a, title, sf, fs, bw, threshold=0):
     Parameters:
         a: complex IQ signal
         title: debug title (unused, can remove)
-        sf: spreading factor
+        sf: spreading facto
         fs: sampling frequency
         bw: bandwidth
         threshold: threshold for peak detection (unused)
@@ -141,29 +141,32 @@ def estimate_symbol_custom(a, title, sf, fs, bw, threshold=0):
     signal_len = len(a)
     t = np.arange(signal_len) / fs
     
-    # 🔧 수정: 올바른 Linear Chirp 생성
+    # ✅ 이론적 심볼 시간 사용
     f0 = -bw / 2
     f1 = bw / 2
-    symbol_time = signal_len / fs
-    k = (f1 - f0) / symbol_time  # chirp rate
+    symbol_time = 2**sf / bw  # 물리적 상수
     
-    # Upchirp: f(t) = f0 + k*t
-    phase = 2 * np.pi * (f0 * t + (k / 2) * t**2)
-    up_chirp_signal = np.exp(1j * phase)
-    down_chirp_signal = np.conj(up_chirp_signal)
+    # Chirp 생성
+    phase = 2 * np.pi * (f0 * t + (bw / (2 * symbol_time)) * t**2)
+    down_chirp = np.conj(np.exp(1j * phase))
     
     # Dechirp
-    dechirped = a * down_chirp_signal
-    
-    # FFT (shift 없이!)
+    dechirped = a * down_chirp
     spectrum = np.fft.fft(dechirped)
     power = np.abs(spectrum) ** 2
     
-    # 🔧 수정: 처음 2^sf bins에서 peak 찾기
+    # ✅ OSF bin folding (핵심!)
     bins = 2 ** sf
-    valid_power = power[:bins]
-    symbol = np.argmax(valid_power)
-    peak_power = valid_power[symbol]
+    osr = int(fs / bw)  # 4
+    power_folded = np.zeros(bins)
+    
+    for i in range(bins):
+        start_idx = i * osr
+        end_idx = min((i + 1) * osr, len(power))
+        power_folded[i] = np.sum(power[start_idx:end_idx])
+    
+    symbol = np.argmax(power_folded)
+    peak_power = power_folded[symbol]
     
     return symbol, peak_power
 
