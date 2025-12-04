@@ -122,54 +122,48 @@ def estimate_symbol(a, title, tresshold=0):
     
     return symbol, peak_power
 
-def estimate_symbol_custom(a, title, sf, fs, bw, threshold=0):
-    """
-    Estimate LoRa symbol from IQ samples using dechirp + FFT
+import numpy as np
+
+def estimate_symbol_custom(a, sf, fs, bw):
+    # 1. 기본 설정
+    num_symbols = 2 ** sf  # 512
     
-    Parameters:
-        a: complex IQ signal
-        title: debug title (unused, can remove)
-        sf: spreading facto
-        fs: sampling frequency
-        bw: bandwidth
-        threshold: threshold for peak detection (unused)
-    
-    Returns:
-        symbol: estimated symbol (0 to 2^sf - 1)
-        peak_power: peak power value
-    """
+    # 2. Dechirp (기존과 동일)
     signal_len = len(a)
     t = np.arange(signal_len) / fs
-    
-    # ✅ 이론적 심볼 시간 사용
     f0 = -bw / 2
-    f1 = bw / 2
-    symbol_time = 2**sf / bw  # 물리적 상수
+    symbol_time = num_symbols / bw
     
-    # Chirp 생성
+    # Down Chirp 생성
     phase = 2 * np.pi * (f0 * t + (bw / (2 * symbol_time)) * t**2)
     down_chirp = np.conj(np.exp(1j * phase))
     
-    # Dechirp
     dechirped = a * down_chirp
     spectrum = np.fft.fft(dechirped)
-    power = np.abs(spectrum) ** 2
     
-    # ✅ OSF bin folding (핵심!)
-    bins = 2 ** sf
-    osr = int(fs / bw)  # 4
-    power_folded = np.zeros(bins)
+    # =======================================================
+    # ✅ 핵심 수정: Folding (오버샘플링된 신호 합치기)
+    # =======================================================
+    # FFT 결과: [0 ~ BW] ... (노이즈) ... [-BW ~ 0]
+    # 뒤쪽(음수 주파수)에 있는 신호 에너지를 앞쪽으로 가져와서 합칩니다.
     
-    for i in range(bins):
-        start_idx = i * osr
-        end_idx = min((i + 1) * osr, len(power))
-        power_folded[i] = np.sum(power[start_idx:end_idx])
+    # 앞쪽 512개 (양수 대역)
+    pos_freq = spectrum[:num_symbols]
     
-    symbol = np.argmax(power_folded)
-    peak_power = power_folded[symbol]
+    # 뒤쪽 512개 (음수 대역)
+    neg_freq = spectrum[-num_symbols:]
+    
+    # 두 신호를 더합니다 (Coherent Adding)
+    # 위상 정렬이 완벽하지 않을 수 있으므로, 안전하게 '파워'를 더하는 것도 방법입니다.
+    # 여기서는 성능이 더 좋은 Coherent Sum을 먼저 시도합니다.
+    folded_spectrum = pos_freq + neg_freq
+    
+    # 파워 계산 및 최대값 찾기
+    power = np.abs(folded_spectrum) ** 2
+    symbol = np.argmax(power)
+    peak_power = power[symbol]
     
     return symbol, peak_power
-
 def awgn(signal, snr_db):
     """Additive White Gaussian Noise (AWGN) to a signal."""
     signal_power = np.mean(np.abs(signal) ** 2)
