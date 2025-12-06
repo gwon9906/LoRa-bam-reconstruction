@@ -574,8 +574,152 @@ class MultiBAMv3:
             X = bam.decompress(X)
         return X 
 
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+class BAMv3_Huber:
+    """
+    Single Layer BAM with Huber Loss & Vectorized Batch Processing
+    """
+    def __init__(self, input_dim, output_dim, eta=1e-4, huber_delta=0.01, device=None):
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.eta = eta
+        self.huber_delta = huber_delta
+        
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # 가중치 초기화
+        self.W = torch.empty(output_dim, input_dim, device=self.device)
+        torch.nn.init.uniform_(self.W, -0.01, 0.01)
+
+    def _output_function(self, Wx):
+        # LoRa 실험에서는 identity 그대로 두고, 필요하면 tanh로 바꿔도 됨
+        return Wx  
+
+    def train(self, X, num_epochs=1, batch_size=32, verbose=False):
+        if not isinstance(X, torch.Tensor):
+            X = torch.tensor(X, dtype=torch.float32, device=self.device)
+        
+        n_samples = X.shape[0]
+        losses = []
+
+        for epoch in range(num_epochs):
+            # Shuffle
+            perm = torch.randperm(n_samples, device=self.device)
+            X = X[perm]
+
+            for i in range(0, n_samples, batch_size):
+                batch = X[i:i+batch_size]        # (B, In)
+                if batch.shape[0] == 0:
+                    continue
+                B = batch.shape[0]
+
+                # 1. Forward (Vectorized)
+                Y = self._output_function(batch @ self.W.T)   # (B, Out)
+                
+                # 2. Reconstruction
+                X_reconstructed = self._output_function(Y @ self.W)  # (B, In)
+                
+                # 3. Error
+                raw_error = batch - X_reconstructed          # (B, In)
+                
+                # 4. Huber Gradient Logic
+                abs_error = torch.abs(raw_error)
+                mse_region = abs_error <= self.huber_delta
+
+                # grad용 effective error (Huber의 dL/dx 부분)
+                effective_error = torch.where(
+                    mse_region,
+                    raw_error,
+                    self.huber_delta * torch.sign(raw_error)
+                )
+
+                # 5. Loss Calculation (모니터링용, per-element 기준)
+                loss_mse = 0.5 * (raw_error[mse_region] ** 2)
+                loss_mae = self.huber_delta * (abs_error[~mse_region] - 0.5 * self.huber_delta)
+                # 전체 element 개수로 나눠서 scale 맞추기
+                num_elems = raw_error.numel()
+                batch_loss = (loss_mse.sum() + loss_mae.sum()) / num_elems
+                losses.append(batch_loss.item())
+
+                # 6. Weight Update (★ batch 평균으로 정규화)
+                grad = (Y.T @ effective_error) / B           # (Out, In)
+                self.W += self.eta * grad
+
+                if torch.isnan(self.W).any():
+                    raise ValueError("NaN detected in weights!")
+
+        return losses
+
+    def compress(self, X):
+        if not isinstance(X, torch.Tensor):
+            X = torch.tensor(X, dtype=torch.float32, device=self.device)
+        else:
+            X = X.to(self.device)
+        # (N, In) @ (In, Out)^T → (N, Out)
+        y = self._output_function(X @ self.W.T)
+        return y.detach().cpu().numpy()
+
+    def decompress(self, compressed_X):
+        # 🔧 여기 버그 수정: compressed_X가 이미 Tensor인 경우에도 Y를 정의해줘야 함
+        if not isinstance(compressed_X, torch.Tensor):
+            Y = torch.tensor(compressed_X, dtype=torch.float32, device=self.device)
+        else:
+            Y = compressed_X.to(self.device)
+        # (N, Out) @ (Out, In) → (N, In)
+        X_reconstructed = self._output_function(Y @ self.W)
+        return X_reconstructed.detach().cpu().numpy()
+
+    def iterative_reconstruction(self, X, iterations=3):
+        """
+        BAM의 공명(Resonance) 효과를 이용한 반복 복원
+        """
+        current_X = X.copy()
+        for i in range(iterations):
+            current_X = self.decompress(self.compress(current_X))
+        return current_X
 
     
+class MultiBAMv3_Huber:
+    """
+    Multi-Layer Wrapper for BAMv3_Huber
+    """
+    def __init__(self, layers_dims, eta=1e-4, huber_delta=0.01, device=None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.bams = []
+        
+        for i in range(len(layers_dims) - 1):
+            bam = BAMv3_Huber(
+                input_dim=layers_dims[i], 
+                output_dim=layers_dims[i + 1], 
+                eta=eta, 
+                huber_delta=huber_delta, 
+                device=self.device
+            )
+            self.bams.append(bam)
+
+    def train(self, X, num_epochs=1, batch_size=32):
+        all_losses = []
+        for i, bam in enumerate(self.bams):
+            print(f"   > Layer {i+1} Training... (Delta: {bam.huber_delta})")
+            losses = bam.train(X, num_epochs=num_epochs, batch_size=batch_size)
+            all_losses.append(losses)
+            X = bam.compress(X)  # 다음 레이어 입력
+        return all_losses
+
+    def compress(self, X):
+        for bam in self.bams:
+            X = bam.compress(X)
+        return X
+
+    def decompress(self, X):
+        for bam in reversed(self.bams):
+            X = bam.decompress(X)
+        return X  
+
+  
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
