@@ -8,7 +8,7 @@ import lz4.frame
 from numpy.linalg import svd
 
 sample_rate = 1e6   # 1 MHz
-bw = 250e3          # LoRa Bandwidth (250 kHz)
+bw = 125e3          # LoRa Bandwidth (250 kHz)
 sf = 9       # Spreading Factor 
 
 symbol_time = 2**sf / bw  # Symbol duration
@@ -164,6 +164,8 @@ def estimate_symbol_custom(a, sf, fs, bw):
     peak_power = power[symbol]
     
     return symbol, peak_power
+
+    
 def awgn(signal, snr_db):
     """Additive White Gaussian Noise (AWGN) to a signal."""
     signal_power = np.mean(np.abs(signal) ** 2)

@@ -599,19 +599,22 @@ class BAMv3_Huber:
         return Wx  
 
     def train(self, X, num_epochs=1, batch_size=32, verbose=False):
+        # 입력을 Tensor로 정규화
         if not isinstance(X, torch.Tensor):
             X = torch.tensor(X, dtype=torch.float32, device=self.device)
+        else:
+            X = X.to(self.device, dtype=torch.float32)
         
         n_samples = X.shape[0]
         losses = []
 
         for epoch in range(num_epochs):
-            # Shuffle
+            # Shuffle (원본 X는 유지, 에폭별 view에만 적용)
             perm = torch.randperm(n_samples, device=self.device)
-            X = X[perm]
+            X_epoch = X[perm]
 
             for i in range(0, n_samples, batch_size):
-                batch = X[i:i+batch_size]        # (B, In)
+                batch = X_epoch[i:i+batch_size]        # (B, In)
                 if batch.shape[0] == 0:
                     continue
                 B = batch.shape[0]
@@ -644,12 +647,16 @@ class BAMv3_Huber:
                 batch_loss = (loss_mse.sum() + loss_mae.sum()) / num_elems
                 losses.append(batch_loss.item())
 
-                # 6. Weight Update (★ batch 평균으로 정규화)
-                grad = (Y.T @ effective_error) / B           # (Out, In)
-                self.W += self.eta * grad
+                # 6. Weight Update (batch 평균으로 정규화)
+                with torch.no_grad():
+                    grad = (Y.T @ effective_error) / B       # (Out, In)
+                    self.W += self.eta * grad
 
                 if torch.isnan(self.W).any():
                     raise ValueError("NaN detected in weights!")
+
+            if verbose:
+                print(f"[Epoch {epoch+1}/{num_epochs}] last batch Huber loss: {batch_loss.item():.6f}")
 
         return losses
 
@@ -657,31 +664,22 @@ class BAMv3_Huber:
         if not isinstance(X, torch.Tensor):
             X = torch.tensor(X, dtype=torch.float32, device=self.device)
         else:
-            X = X.to(self.device)
+            X = X.to(self.device, dtype=torch.float32)
         # (N, In) @ (In, Out)^T → (N, Out)
         y = self._output_function(X @ self.W.T)
         return y.detach().cpu().numpy()
 
     def decompress(self, compressed_X):
-        # 🔧 여기 버그 수정: compressed_X가 이미 Tensor인 경우에도 Y를 정의해줘야 함
+        # compressed_X가 np.ndarray든 Tensor든 모두 처리
         if not isinstance(compressed_X, torch.Tensor):
             Y = torch.tensor(compressed_X, dtype=torch.float32, device=self.device)
         else:
-            Y = compressed_X.to(self.device)
+            Y = compressed_X.to(self.device, dtype=torch.float32)
         # (N, Out) @ (Out, In) → (N, In)
         X_reconstructed = self._output_function(Y @ self.W)
         return X_reconstructed.detach().cpu().numpy()
 
-    def iterative_reconstruction(self, X, iterations=3):
-        """
-        BAM의 공명(Resonance) 효과를 이용한 반복 복원
-        """
-        current_X = X.copy()
-        for i in range(iterations):
-            current_X = self.decompress(self.compress(current_X))
-        return current_X
 
-    
 class MultiBAMv3_Huber:
     """
     Multi-Layer Wrapper for BAMv3_Huber
@@ -717,7 +715,7 @@ class MultiBAMv3_Huber:
     def decompress(self, X):
         for bam in reversed(self.bams):
             X = bam.decompress(X)
-        return X  
+        return X
 
   
 import torch

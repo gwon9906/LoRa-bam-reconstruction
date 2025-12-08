@@ -44,11 +44,11 @@ def estimate_symbol_final(a, sf, fs, bw):
 def run_simulation_demo():
     # 설정
     sf = 9
-    bw = 250000
-    osf = 4
+    bw = 125000
+    osf = 8
     fs = bw * osf
     num_symbols = 2**sf
-    snr_db = -15  # 테스트 목표 SNR
+    snr_db = -25  # 테스트 목표 SNR
     trials = 1000
     
     print(f"Simulation Start: SF{sf}, SNR {snr_db}dB, Trials {trials}")
