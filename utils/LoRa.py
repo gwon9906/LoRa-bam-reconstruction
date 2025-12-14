@@ -749,13 +749,18 @@ class BAMv4(nn.Module):
         # Encoder weight (latent_dim x input_dim)
         self.encoder = nn.Linear(input_dim, latent_dim, bias=False)
 
-        # Activation
         if activation == "tanh":
             self.activation = torch.tanh
+
         elif activation == "relu":
             self.activation = F.relu
+
+        elif activation == "leaky_relu":
+            self.activation = F.leaky_relu
+
         elif activation is None or activation == "none":
             self.activation = None
+
         else:
             raise ValueError(f"Unknown activation: {activation}")
 
@@ -912,10 +917,16 @@ class MultiBAMv4(nn.Module):
         # Activation
         if activation == "tanh":
             self.activation = torch.tanh
+
         elif activation == "relu":
             self.activation = F.relu
+
+        elif activation == "leaky_relu":
+            self.activation = F.leaky_relu
+
         elif activation is None or activation == "none":
             self.activation = None
+
         else:
             raise ValueError(f"Unknown activation: {activation}")
 
@@ -1029,7 +1040,385 @@ class MultiBAMv4(nn.Module):
 
         return history
     
-          
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MultiBAMv5(nn.Module):
+    """
+    MultiBAMv5
+    - Untied encoder/decoder
+    - Residual output
+    - Optional BatchNorm
+    - Flexible activation functions
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        hidden_dims,
+        activation="relu",
+        residual_alpha=1.0,
+        use_bn=False,
+        device=None,
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dims = hidden_dims
+        self.residual_alpha = residual_alpha
+        self.use_bn = use_bn
+
+        # device 설정
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+
+        # -----------------------------
+        # Activation 설정
+        # -----------------------------
+        act = activation.lower() if isinstance(activation, str) else activation
+
+        if act is None or act == "none":
+            self.activation = None
+        elif act == "tanh":
+            self.activation = torch.tanh
+        elif act == "relu":
+            self.activation = F.relu
+        elif act in ("leaky_relu", "leaky relu", "lrelu"):
+            self.activation = F.leaky_relu
+        else:
+            raise ValueError(f"Unknown activation: {activation}")
+
+        # -----------------------------
+        # Encoder layers 생성
+        # -----------------------------
+        dims = [input_dim] + hidden_dims
+        self.encoder_layers = nn.ModuleList()
+        self.encoder_bns = nn.ModuleList()
+
+        for in_d, out_d in zip(dims[:-1], dims[1:]):
+            linear = nn.Linear(in_d, out_d, bias=False)
+            nn.init.xavier_uniform_(linear.weight)
+            self.encoder_layers.append(linear)
+
+            if use_bn:
+                self.encoder_bns.append(nn.BatchNorm1d(out_d))
+            else:
+                self.encoder_bns.append(None)
+
+        # -----------------------------
+        # Decoder layers 생성 (untied)
+        # -----------------------------
+        dec_dims = list(reversed(dims))
+        self.decoder_layers = nn.ModuleList()
+        self.decoder_bns = nn.ModuleList()
+
+        for in_d, out_d in zip(dec_dims[:-1], dec_dims[1:]):
+            linear = nn.Linear(in_d, out_d, bias=False)
+            nn.init.xavier_uniform_(linear.weight)
+            self.decoder_layers.append(linear)
+
+            if use_bn:
+                self.decoder_bns.append(nn.BatchNorm1d(out_d))
+            else:
+                self.decoder_bns.append(None)
+
+        self.to(self.device)
+
+    # -----------------------------
+    # encoder
+    # -----------------------------
+    def encode(self, x):
+        h = x
+        for idx, layer in enumerate(self.encoder_layers):
+            h = layer(h)
+            if self.encoder_bns[idx] is not None:
+                h = self.encoder_bns[idx](h)
+            if self.activation is not None:
+                h = self.activation(h)
+        return h
+
+    # -----------------------------
+    # decoder
+    # -----------------------------
+    def decode(self, z):
+        h = z
+        for idx, layer in enumerate(self.decoder_layers):
+            h = layer(h)
+            if self.decoder_bns[idx] is not None:
+                h = self.decoder_bns[idx](h)
+            if self.activation is not None:
+                h = self.activation(h)
+        return h
+
+    # -----------------------------
+    # forward (Residual 포함)
+    # -----------------------------
+    def forward(self, x_noisy):
+        z = self.encode(x_noisy)
+        delta = self.decode(z)
+        return x_noisy + self.residual_alpha * delta
+
+    # -----------------------------
+    # numpy 버전
+    # -----------------------------
+    def _to_tensor(self, x):
+        if isinstance(x, (list, tuple)):
+            x = torch.tensor(x, dtype=torch.float32)
+        elif isinstance(x, np.ndarray):
+            x = torch.from_numpy(x.astype(np.float32))
+        return x.to(self.device)
+
+    def reconstruct_numpy(self, x_noisy_np):
+        self.eval()
+        with torch.no_grad():
+            x_noisy = self._to_tensor(x_noisy_np)
+            x_hat = self.forward(x_noisy)
+            return x_hat.cpu().numpy()
+
+    # -----------------------------
+    # 학습 함수
+    # -----------------------------
+    def fit_denoise(
+        self,
+        X_noisy,
+        X_clean,
+        num_epochs=1,
+        batch_size=64,
+        lr=1e-3,
+        weight_decay=0.0,
+        verbose=True,
+    ):
+        Xn = self._to_tensor(X_noisy)
+        Xc = self._to_tensor(X_clean)
+
+        dataset = torch.utils.data.TensorDataset(Xn, Xc)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
+        criterion = nn.HuberLoss(delta=0.02)
+
+        history = []
+
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            for noisy, clean in loader:
+                optimizer.zero_grad()
+                out = self.forward(noisy)
+                loss = criterion(out, clean)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item() * noisy.size(0)
+
+            epoch_loss /= len(dataset)
+            history.append(epoch_loss)
+
+            if verbose:
+                print(f"[v5] Epoch {epoch+1}/{num_epochs} | Loss = {epoch_loss:.6f}")
+
+        return history
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+
+class ResidualFCBlock(nn.Module):
+    """
+    Fully-connected residual block:
+    y = skip(x) + main(x)
+    - main: Linear -> (BN) -> act -> Linear
+    - skip: identity or Linear (if in_dim != out_dim)
+    """
+    def __init__(self, in_dim, out_dim, activation="relu", use_bn=False):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.use_bn = use_bn
+
+        # activation 함수 선택
+        act = activation.lower() if isinstance(activation, str) else activation
+        if act is None or act == "none":
+            self.act_fn = None
+        elif act == "tanh":
+            self.act_fn = torch.tanh
+        elif act == "relu":
+            self.act_fn = F.relu
+        elif act in ("leaky_relu", "leaky relu", "lrelu"):
+            self.act_fn = F.leaky_relu
+        else:
+            raise ValueError(f"Unknown activation in ResidualFCBlock: {activation}")
+
+        # main branch
+        hidden_dim = max(out_dim, in_dim)  # 중간 차원, 너무 작게 줄이지 않게
+        self.fc1 = nn.Linear(in_dim, hidden_dim, bias=False)
+        self.fc2 = nn.Linear(hidden_dim, out_dim, bias=False)
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.xavier_uniform_(self.fc2.weight)
+
+        if use_bn:
+            self.bn1 = nn.BatchNorm1d(hidden_dim)
+            self.bn2 = nn.BatchNorm1d(out_dim)
+        else:
+            self.bn1 = None
+            self.bn2 = None
+
+        # skip branch (projection if needed)
+        if in_dim != out_dim:
+            self.skip_proj = nn.Linear(in_dim, out_dim, bias=False)
+            nn.init.xavier_uniform_(self.skip_proj.weight)
+        else:
+            self.skip_proj = None
+
+    def forward(self, x):
+        # main
+        h = self.fc1(x)
+        if self.bn1 is not None:
+            h = self.bn1(h)
+        if self.act_fn is not None:
+            h = self.act_fn(h)
+
+        h = self.fc2(h)
+        if self.bn2 is not None:
+            h = self.bn2(h)
+
+        # skip
+        if self.skip_proj is not None:
+            s = self.skip_proj(x)
+        else:
+            s = x
+
+        out = h + s
+        # 마지막에 activation 한 번 더 줄지 말지는 선택인데, 여기서는 주는 쪽으로
+        if self.act_fn is not None:
+            out = self.act_fn(out)
+        return out
+
+
+class MultiBAMv6(nn.Module):
+    """
+    MultiBAMv6
+    - Encoder/Decoder: Residual FC Blocks (untied)
+    - Outer residual: x_hat = x_noisy + alpha * delta
+    - Optional BatchNorm inside blocks
+    """
+    def __init__(
+        self,
+        input_dim,
+        hidden_dims,
+        activation="relu",
+        residual_alpha=1.0,
+        use_bn=False,
+        device=None,
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dims = hidden_dims
+        self.residual_alpha = residual_alpha
+        self.use_bn = use_bn
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+
+        # encoder: input_dim -> hidden_dims[-1]
+        dims = [input_dim] + hidden_dims
+        self.encoder_blocks = nn.ModuleList()
+        for in_d, out_d in zip(dims[:-1], dims[1:]):
+            block = ResidualFCBlock(in_d, out_d, activation=activation, use_bn=use_bn)
+            self.encoder_blocks.append(block)
+
+        # decoder: reverse path
+        dec_dims = list(reversed(dims))
+        self.decoder_blocks = nn.ModuleList()
+        for in_d, out_d in zip(dec_dims[:-1], dec_dims[1:]):
+            block = ResidualFCBlock(in_d, out_d, activation=activation, use_bn=use_bn)
+            self.decoder_blocks.append(block)
+
+        self.to(self.device)
+
+    # ---- helper ----
+    def _to_tensor(self, x):
+        if isinstance(x, (list, tuple)):
+            x = torch.tensor(x, dtype=torch.float32)
+        elif isinstance(x, np.ndarray):
+            x = torch.from_numpy(x.astype(np.float32))
+        return x.to(self.device)
+
+    # ---- encode/decode ----
+    def encode(self, x):
+        h = x
+        for block in self.encoder_blocks:
+            h = block(h)
+        return h
+
+    def decode(self, z):
+        h = z
+        for block in self.decoder_blocks:
+            h = block(h)
+        return h
+
+    # ---- forward (outer residual) ----
+    def forward(self, x_noisy):
+        z = self.encode(x_noisy)
+        delta = self.decode(z)
+        return x_noisy + self.residual_alpha * delta
+
+    # ---- numpy interface ----
+    def reconstruct_numpy(self, x_noisy_np):
+        self.eval()
+        with torch.no_grad():
+            x_noisy = self._to_tensor(x_noisy_np)
+            x_hat = self.forward(x_noisy)
+            return x_hat.cpu().numpy()
+
+    # ---- training ----
+    def fit_denoise(
+        self,
+        X_noisy,
+        X_clean,
+        num_epochs=1,
+        batch_size=64,
+        lr=1e-4,
+        weight_decay=0.0,
+        verbose=True,
+    ):
+        Xn = self._to_tensor(X_noisy)
+        Xc = self._to_tensor(X_clean)
+
+        dataset = torch.utils.data.TensorDataset(Xn, Xc)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
+        criterion = nn.MSELoss()
+
+        history = []
+        for epoch in range(num_epochs):
+            self.train()
+            epoch_loss = 0.0
+            for noisy, clean in loader:
+                optimizer.zero_grad()
+                out = self.forward(noisy)
+                loss = criterion(out, clean)
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+
+                optimizer.step()
+                epoch_loss += loss.item() * noisy.size(0)
+
+            epoch_loss /= len(dataset)
+            history.append(epoch_loss)
+            if verbose:
+                print(f"[v6] Epoch {epoch+1}/{num_epochs} | Loss = {epoch_loss:.6f}")
+
+        return history
+
 # # --------------------------
 # # U-NET (small, configurable)
 # # --------------------------
@@ -1242,150 +1631,3 @@ class MultiBAMv4(nn.Module):
     # im_hat = pred[1] * scale
     # # re_hat/im_hat are your reconstructed spectrogram channels
 
-
-# ========================================
-#  BAMv5: Supervised Learning Version
-# ========================================
-
-class BAMv5:
-    """
-    BAMv5: Supervised learning을 위한 BAM
-    - X_input과 X_target을 분리해서 학습
-    - PyTorch 기반, GPU 가속
-    """
-    def __init__(self, input_dim, output_dim, eta=1e-4, device=None):
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.eta = eta
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.W = torch.empty(output_dim, input_dim, device=self.device)
-        torch.nn.init.uniform_(self.W, -0.01, 0.01)
-
-    def _output_function(self, Wx):
-        return Wx  # Linear activation
-
-    def train_supervised(self, X_input, X_target, num_epochs=1, batch_size=32, verbose=True):
-        """
-        Supervised training: X_input → compress → decompress → X_target
-        
-        Parameters:
-        -----------
-        X_input : np.ndarray
-            입력 데이터 (noisy)
-        X_target : np.ndarray
-            타겟 데이터 (clean)
-        """
-        X_input = torch.tensor(X_input, dtype=torch.float32, device=self.device)
-        X_target = torch.tensor(X_target, dtype=torch.float32, device=self.device)
-        n_samples = X_input.shape[0]
-        losses = []
-
-        for epoch in range(num_epochs):
-            perm = torch.randperm(n_samples, device=self.device)
-            X_input_shuffled = X_input[perm]
-            X_target_shuffled = X_target[perm]
-
-            for i in range(0, n_samples, batch_size):
-                batch_input = X_input_shuffled[i:i+batch_size]
-                batch_target = X_target_shuffled[i:i+batch_size]
-                batch_errors = []
-
-                for x_in, x_tgt in zip(batch_input, batch_target):
-                    x_in = x_in.view(1, -1)
-                    x_tgt = x_tgt.view(1, -1)
-                    
-                    # Forward: input → compressed → reconstructed
-                    y = self._output_function(self.W @ x_in.T)
-                    x_reconstructed = self._output_function(self.W.T @ y)
-
-                    # Error: target - reconstructed
-                    error = x_tgt - x_reconstructed.T
-                    batch_errors.append(torch.mean(error ** 2).item())
-
-                    # Update weights
-                    self.W += self.eta * (y @ error)
-
-                    if torch.isnan(self.W).any():
-                        raise ValueError("NaN detected in weights!")
-
-                batch_mse = sum(batch_errors) / len(batch_errors)
-                losses.append(batch_mse)
-                
-                if verbose:
-                    print(f"Epoch {epoch+1}, Batch {i//batch_size+1}/{(n_samples+batch_size-1)//batch_size}, MSE = {batch_mse:.6f}")
-
-        return losses
-
-    def compress(self, X):
-        X = torch.tensor(X, dtype=torch.float32, device=self.device)
-        y = self._output_function(self.W @ X.T).T
-        return y.detach().cpu().numpy()
-
-    def decompress(self, compressed_X):
-        Y = torch.tensor(compressed_X, dtype=torch.float32, device=self.device)
-        X_reconstructed = self._output_function(self.W.T @ Y.T).T
-        return X_reconstructed.detach().cpu().numpy()
-
-
-class MultiBAMv5:
-    """
-    MultiBAMv5: Supervised learning을 위한 Multi-layer BAM
-    """
-    def __init__(self, layers_dims, eta=1e-4, device=None):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.bams = [
-            BAMv5(layers_dims[i], layers_dims[i + 1], eta, self.device)
-            for i in range(len(layers_dims) - 1)
-        ]
-
-    def train_supervised(self, X_input, X_target, num_epochs=1, batch_size=32):
-        """
-        Multi-layer supervised training
-        
-        각 레이어는 자신의 차원으로 재구성하도록 학습
-        Layer i: noisy_i → compress → decompress → noisy_i (autoencoder)
-        하지만 전체 목표는 noisy → clean이 되도록
-        
-        Parameters:
-        -----------
-        X_input : np.ndarray
-            입력 데이터 (noisy)
-        X_target : np.ndarray
-            타겟 데이터 (clean)
-        """
-        all_losses = []
-
-        # Train each layer
-        X_current_input = X_input
-        X_current_target = X_target
-        
-        for i, bam in enumerate(self.bams):
-            print(f"\n--- Training Layer {i+1}/{len(self.bams)} ---")
-            print(f"   Input shape: {X_current_input.shape}")
-            print(f"   Target shape: {X_current_target.shape}")
-            
-            # 각 BAM은 input_dim → output_dim → input_dim으로 작동
-            # input과 target이 같은 차원이어야 함!
-            losses = bam.train_supervised(
-                X_current_input, X_current_target, 
-                num_epochs=num_epochs, batch_size=batch_size
-            )
-            all_losses.append(losses)
-            
-            # 다음 레이어를 위해 둘 다 압축
-            # 중요: 학습이 끝난 후 압축해야 함!
-            X_current_input = bam.compress(X_current_input)
-            X_current_target = bam.compress(X_current_target)
-
-        return all_losses
-
-    def compress(self, X):
-        for bam in self.bams:
-            X = bam.compress(X)
-        return X
-
-    def decompress(self, X):
-        for bam in reversed(self.bams):
-            X = bam.decompress(X)
-        return X
