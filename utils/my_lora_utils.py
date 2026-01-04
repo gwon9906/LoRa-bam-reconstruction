@@ -141,21 +141,12 @@ def estimate_symbol_custom(a, sf, fs, bw):
     dechirped = a * down_chirp
     spectrum = np.fft.fft(dechirped)
     
-    # =======================================================
-    # ✅ 핵심 수정: Folding (오버샘플링된 신호 합치기)
-    # =======================================================
-    # FFT 결과: [0 ~ BW] ... (노이즈) ... [-BW ~ 0]
-    # 뒤쪽(음수 주파수)에 있는 신호 에너지를 앞쪽으로 가져와서 합칩니다.
-    
     # 앞쪽 512개 (양수 대역)
     pos_freq = spectrum[:num_symbols]
     
     # 뒤쪽 512개 (음수 대역)
     neg_freq = spectrum[-num_symbols:]
     
-    # 두 신호를 더합니다 (Coherent Adding)
-    # 위상 정렬이 완벽하지 않을 수 있으므로, 안전하게 '파워'를 더하는 것도 방법입니다.
-    # 여기서는 성능이 더 좋은 Coherent Sum을 먼저 시도합니다.
     folded_spectrum = pos_freq + neg_freq
     
     # 파워 계산 및 최대값 찾기

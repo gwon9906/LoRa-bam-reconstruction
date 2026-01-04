@@ -469,98 +469,96 @@ And the most importantly, add torch instead of classical numpy
 its increase the speed while maintain the performace
 """
 class BAMv3:
-    def __init__(self, input_dim, output_dim, eta=1e-5, device=None):
+    def __init__(self, input_dim, output_dim, eta=1e-5, device=None, max_update_norm=1.0, weight_decay=1e-4):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.eta = eta
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.max_update_norm = max_update_norm
+        self.weight_decay = weight_decay
 
         self.W = torch.empty(output_dim, input_dim, device=self.device)
         torch.nn.init.uniform_(self.W, -0.01, 0.01)
 
     def _output_function(self, Wx):
-        return Wx  
+        return Wx
 
-    def train(self, X, num_epochs=1, batch_size=32, verbose=True):
-        # n_samples = X.shape[0]
-        X = torch.tensor(X, dtype=torch.float32, device=self.device)
-        n_samples = X.shape[0]
+    def train(self, X_in, X_target, num_epochs=1, batch_size=64, verbose=True):
+        X_in = torch.tensor(X_in, dtype=torch.float32, device=self.device)
+        X_tg = torch.tensor(X_target, dtype=torch.float32, device=self.device)
+
+        n_samples = X_in.shape[0]
         losses = []
 
         for epoch in range(num_epochs):
             perm = torch.randperm(n_samples, device=self.device)
-            X = X[perm]
+            X_in = X_in[perm]
+            X_tg = X_tg[perm]
 
             for i in range(0, n_samples, batch_size):
-                batch = X[i:i+batch_size]
-                batch_errors = []
+                xb = X_in[i:i+batch_size]     # (B, in)
+                tb = X_tg[i:i+batch_size]     # (B, in)
 
-                for x in batch:
-                    x = x.view(1, -1)
-                    y = self._output_function(self.W @ x.T)
-                    x_reconstructed = self._output_function(self.W.T @ y)
+                Xb = xb.T                      # (in, B)
+                Tb = tb.T                      # (in, B)
 
-                    error = x - x_reconstructed.T
-                    batch_errors.append(torch.mean(error ** 2).item())
+                Y  = self.W @ Xb               # (out, B)
+                Xh = self.W.T @ Y              # (in, B)
 
-                    self.W += self.eta * (y @ error)
+                E  = Tb - Xh                   # ✅ target 기준 error
 
-                    if torch.isnan(self.W).any():
-                        raise ValueError("NaN detected in weights!")
+                # 배치 평균 업데이트
+                update = self.eta * (Y @ E.T) / xb.shape[0]   # (out, in)
 
-                # average error for this batch
-                batch_mse = sum(batch_errors) / len(batch_errors)
+                # update norm clipping
+                u_norm = torch.norm(update)
+                if u_norm > self.max_update_norm:
+                    update = update * (self.max_update_norm / (u_norm + 1e-12))
+
+                # weight decay (폭발 방지)
+                self.W = (1.0 - self.weight_decay) * self.W + update
+
+                # loss 기록 (target 기준)
+                batch_mse = torch.mean((Tb - Xh) ** 2).item()
                 losses.append(batch_mse)
-                
+
                 if verbose:
-                    print(f"Epoch {epoch+1}, Batch {i//batch_size+1}/{(n_samples+batch_size-1)//batch_size}, MSE = {batch_mse:.6f}")
+                    print(f"Epoch {epoch+1}, Batch {i//batch_size+1}/{(n_samples+batch_size-1)//batch_size}, MSE={batch_mse:.6f}")
 
         return losses
 
     def compress(self, X):
         X = torch.tensor(X, dtype=torch.float32, device=self.device)
-        y = self._output_function(self.W @ X.T).T
+        y = (self.W @ X.T).T
         return y.detach().cpu().numpy()
 
-    def decompress(self, compressed_X):
-        Y = torch.tensor(compressed_X, dtype=torch.float32, device=self.device)
-        X_reconstructed = self._output_function(self.W.T @ Y.T).T
-        return X_reconstructed.detach().cpu().numpy()
-
-    def iterative_reconstruction(self, X, iterations=3):
-        """
-        BAM의 핵심: 공명(Resonance) 효과를 이용한 반복 복원
-        신호를 여러 번 통과시켜 노이즈를 점진적으로 깎아냄
-        """
-        current_X = X.copy() # 혹은 torch.clone()
-        
-        for i in range(iterations):
-            # 압축 (Encode)
-            compressed = self.compress(current_X)
-            # 복원 (Decode)
-            reconstructed = self.decompress(compressed)
-            
-            # 다음 단계 입력으로 사용 (Feedback)
-            current_X = reconstructed
-            
-        return current_X
+    def decompress(self, Y):
+        Y = torch.tensor(Y, dtype=torch.float32, device=self.device)
+        x = (self.W.T @ Y.T).T
+        return x.detach().cpu().numpy()
     
 class MultiBAMv3:
-    def __init__(self, layers_dims, eta=1e-4, device=None):
+    def __init__(self, layers_dims, eta=1e-5, device=None, max_update_norm=1.0, weight_decay=1e-4):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.bams = [
-            BAMv3(layers_dims[i], layers_dims[i + 1], eta, self.device)
+            BAMv3(layers_dims[i], layers_dims[i + 1],
+                  eta=eta, device=self.device,
+                  max_update_norm=max_update_norm,
+                  weight_decay=weight_decay)
             for i in range(len(layers_dims) - 1)
         ]
 
-    def train(self, X, num_epochs=1, batch_size=32):
+    def train(self, X_noisy, X_clean, num_epochs=1, batch_size=64):
         all_losses = []
 
-        for i, bam in enumerate(self.bams):
-            print(f"\n--- Training Layer {i+1}/{len(self.bams)} ---")
-            losses = bam.train(X, num_epochs=num_epochs, batch_size=batch_size)
+        for li, bam in enumerate(self.bams):
+            print(f"\n--- Training Layer {li+1}/{len(self.bams)} ---")
+            losses = bam.train(X_noisy, X_clean, num_epochs=num_epochs, batch_size=batch_size, verbose=True)
             all_losses.append(losses)
-            X = bam.compress(X)  # feed compressed output to next layer
+
+            # 다음 레이어 입력/타깃 모두 같은 방식으로 압축
+            X_noisy = bam.compress(X_noisy)
+            X_clean = bam.compress(X_clean)
 
         return all_losses
 
@@ -572,7 +570,8 @@ class MultiBAMv3:
     def decompress(self, X):
         for bam in reversed(self.bams):
             X = bam.decompress(X)
-        return X 
+        return X
+
 
 import torch
 import numpy as np
@@ -1339,6 +1338,11 @@ class MultiBAMv6(nn.Module):
         for in_d, out_d in zip(dec_dims[:-1], dec_dims[1:]):
             block = ResidualFCBlock(in_d, out_d, activation=activation, use_bn=use_bn)
             self.decoder_blocks.append(block)
+            
+        self.out_linear = nn.Linear(input_dim, input_dim, bias=False)
+        nn.init.xavier_uniform_(self.out_linear.weight)
+
+        
 
         self.to(self.device)
 
@@ -1361,6 +1365,7 @@ class MultiBAMv6(nn.Module):
         h = z
         for block in self.decoder_blocks:
             h = block(h)
+        h = self.out_linear(h)     # ✅ 여기로 옮겨도 됨
         return h
 
     # ---- forward (outer residual) ----
