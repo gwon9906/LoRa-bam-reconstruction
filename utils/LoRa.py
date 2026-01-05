@@ -10,7 +10,7 @@ from scipy import signal
 import torch
 
 class LoRa:
-    def __init__(self, sf, bw, OSF=4):
+    def __init__(self, sf, bw, OSF=8):
         """
         sf : spreading factor
         bw : bandwidth (Hz)
