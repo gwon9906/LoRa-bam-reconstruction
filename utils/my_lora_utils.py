@@ -230,7 +230,7 @@ def show_multiple_spectrograms(spec_list, titles=None, ncols=3):
             ax.set_title(titles[i] if titles else f"Spectrogram {i+1}")
             ax.set_xlabel("Time bins")
             ax.set_ylabel("Frequency bins")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)   
         else:
             ax.axis('off')
 
