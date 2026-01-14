@@ -1438,9 +1438,13 @@ class ComplexIQBAM(nn.Module):
       * accepts [B, T] or [B, T, 1] (torch.cfloat)
       * returns same shape as input
 
-    - Dynamics (Euler, inner steps):
-        du/dt = -Du * u + g * W_vu * f(v) + x_t
-        dv/dt = -Dv * v + g * W_uv * f(u)
+        - Dynamics (Euler, inner steps):
+                dv/dt = -Dv * v + g * W_uv * f(u)
+                du/dt = -Du * u + g * W_vu * f(v) + (inject_input ? x_t : 0)
+
+            여기서 `inject_input`은 **inner step 동안 외부 입력(x_t)을 계속 주입할지**를 제어합니다.
+            - inject_input=True  : 논문식 forcing 형태에 가깝게, 매 inner step에서 +x_t를 포함
+            - inject_input=False : inner step은 자율 동역학(autonomous)으로 수렴(단, u 초기화/anchor는 별도)
 
     - Activation: split tanh (tanh on real/imag separately), as in common complex BAM assumptions.
     - Decay: positive via softplus + floor.
@@ -1458,6 +1462,7 @@ class ComplexIQBAM(nn.Module):
         stability_margin: float = 0.5,  # <1 means stricter stability
         use_gain_clamp: bool = True,
         anchor_strength: float = 0.10,  # how strongly to keep u close to input (prevents drift)
+        inject_input: bool = True,      # whether to inject x_t at every inner step
         init_scale: float = 0.01,       # complex weight init scale
     ):
         super().__init__()
@@ -1469,6 +1474,7 @@ class ComplexIQBAM(nn.Module):
         self.stability_margin = float(stability_margin)
         self.use_gain_clamp = bool(use_gain_clamp)
         self.anchor_strength = float(anchor_strength)
+        self.inject_input = bool(inject_input)
 
         # Positive decays (learnable)
         self.raw_decay_u = nn.Parameter(torch.ones(self.n) * float(decay_init))
@@ -1544,7 +1550,9 @@ class ComplexIQBAM(nn.Module):
         fu = self.split_tanh(u)
         fv = self.split_tanh(v)
 
-        du = -Du * u + g * self.W_vu(fv) + x_t
+        du = -Du * u + g * self.W_vu(fv)
+        if self.inject_input:
+            du = du + x_t
         dv = -Dv * v + g * self.W_uv(fu)
 
         u_new = u + self.dt * du
@@ -1554,10 +1562,21 @@ class ComplexIQBAM(nn.Module):
     # ------------------------
     # forward
     # ------------------------
-    def forward(self, noisy_iq: torch.Tensor, v0: torch.Tensor | None = None):
+    def forward(
+        self,
+        noisy_iq: torch.Tensor,
+        v0: torch.Tensor | None = None,
+        *,
+        return_trace: bool = False,
+        trace_t: int | None = None,
+    ):
         """
         noisy_iq: [B,T] or [B,T,1] complex (torch.cfloat)
         returns : same shape
+
+        return_trace=True 이면 (out, trace)를 반환합니다.
+        - trace_t: 추적할 시간 인덱스 t (None이면 가운데 t=T//2)
+        - trace에는 해당 t에서 inner step별 u의 변화 및 노름/오차 요약이 담깁니다.
         """
         if noisy_iq.dtype != torch.cfloat and noisy_iq.dtype != torch.cdouble:
             raise TypeError("noisy_iq must be complex (torch.cfloat or torch.cdouble).")
@@ -1580,11 +1599,29 @@ class ComplexIQBAM(nn.Module):
         v = torch.zeros(B, self.m, dtype=dtype, device=device) if v0 is None else v0.to(device=device, dtype=dtype)
 
         outs = []
+
+        do_trace = bool(return_trace)
+        if do_trace:
+            if trace_t is None:
+                trace_t = int(T // 2)
+            trace_t = int(max(0, min(int(trace_t), T - 1)))
+
+            # store only what we need for logging (avoid huge memory)
+            trace_u = []        # list of [B,1]
+            trace_u_l2 = []     # list of scalar tensors
+            trace_v_l2 = []     # list of scalar tensors
+            trace_ux_l2 = []    # ||u-x_t||^2 mean
         for t in range(T):
             x_t = noisy_iq[:, t, :]  # [B,1]
 
             # initialize u near current input (helps convergence early)
             u = x_t
+
+            if do_trace and t == trace_t:
+                trace_u.append(u)
+                trace_u_l2.append((u.real**2 + u.imag**2).mean())
+                trace_v_l2.append((v.real**2 + v.imag**2).mean())
+                trace_ux_l2.append(((u - x_t).real**2 + (u - x_t).imag**2).mean())
 
             # inner convergence loop
             for s in range(self.steps):
@@ -1596,10 +1633,32 @@ class ComplexIQBAM(nn.Module):
                     a = self.anchor_strength * (1.0 - (s / max(1, self.steps)))
                     u = (1 - a) * u + a * x_t
 
+                if do_trace and t == trace_t:
+                    trace_u.append(u)
+                    trace_u_l2.append((u.real**2 + u.imag**2).mean())
+                    trace_v_l2.append((v.real**2 + v.imag**2).mean())
+                    trace_ux_l2.append(((u - x_t).real**2 + (u - x_t).imag**2).mean())
+
             outs.append(u)
 
         out = torch.stack(outs, dim=1)  # [B,T,1]
-        return out.squeeze(-1) if squeeze_last else out
+        out = out.squeeze(-1) if squeeze_last else out
+
+        if not do_trace:
+            return out
+
+        trace = {
+            "trace_t": int(trace_t),
+            "steps": int(self.steps),
+            "dt": float(self.dt),
+            "inject_input": bool(self.inject_input),
+            "anchor_strength": float(self.anchor_strength),
+            "u": torch.stack(trace_u, dim=0),              # [S+1, B, 1]
+            "u_l2": torch.stack(trace_u_l2, dim=0),        # [S+1]
+            "v_l2": torch.stack(trace_v_l2, dim=0),        # [S+1]
+            "ux_l2": torch.stack(trace_ux_l2, dim=0),      # [S+1]
+        }
+        return out, trace
 
     @torch.no_grad()
     def stability_info(self):
