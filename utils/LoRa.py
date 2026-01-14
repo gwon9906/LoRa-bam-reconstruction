@@ -1424,6 +1424,201 @@ class MultiBAMv6(nn.Module):
 
         return history
 
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ComplexIQBAM(nn.Module):
+    """
+    Single-layer Complex-Valued BAM (paper-style dynamics) for IQ denoising.
+
+    - Input/Output: complex IQ sequence
+      * accepts [B, T] or [B, T, 1] (torch.cfloat)
+      * returns same shape as input
+
+    - Dynamics (Euler, inner steps):
+        du/dt = -Du * u + g * W_vu * f(v) + x_t
+        dv/dt = -Dv * v + g * W_uv * f(u)
+
+    - Activation: split tanh (tanh on real/imag separately), as in common complex BAM assumptions.
+    - Decay: positive via softplus + floor.
+    - Optional stability: gain clamped by Du,Dv and weight norms (can be turned off).
+    """
+
+    def __init__(
+        self,
+        m_units: int,               # size of V layer (memory)
+        dt: float = 0.05,
+        steps: int = 15,
+        decay_init: float = 1.0,    # initial decay (positive after softplus)
+        decay_floor: float = 0.1,   # minimal decay to avoid near-zero
+        w_gain_init: float = 0.1,   # coupling gain init
+        stability_margin: float = 0.5,  # <1 means stricter stability
+        use_gain_clamp: bool = True,
+        anchor_strength: float = 0.10,  # how strongly to keep u close to input (prevents drift)
+        init_scale: float = 0.01,       # complex weight init scale
+    ):
+        super().__init__()
+        self.n = 1
+        self.m = int(m_units)
+        self.dt = float(dt)
+        self.steps = int(steps)
+        self.decay_floor = float(decay_floor)
+        self.stability_margin = float(stability_margin)
+        self.use_gain_clamp = bool(use_gain_clamp)
+        self.anchor_strength = float(anchor_strength)
+
+        # Positive decays (learnable)
+        self.raw_decay_u = nn.Parameter(torch.ones(self.n) * float(decay_init))
+        self.raw_decay_v = nn.Parameter(torch.ones(self.m) * float(decay_init))
+
+        # Gain (learnable)
+        self.raw_w_gain = nn.Parameter(torch.tensor(float(w_gain_init)))
+
+        # Complex weights: U(1) <-> V(m)
+        self.W_uv = nn.Linear(self.n, self.m, bias=False, dtype=torch.cfloat)  # u -> v
+        self.W_vu = nn.Linear(self.m, self.n, bias=False, dtype=torch.cfloat)  # v -> u
+
+        self._init_complex_weights(init_scale)
+
+    # ------------------------
+    # init / constraints
+    # ------------------------
+    def _init_complex_weights(self, init_scale: float):
+        with torch.no_grad():
+            su = init_scale / math.sqrt(max(1, self.n))
+            sv = init_scale / math.sqrt(max(1, self.m))
+            self.W_uv.weight.real.normal_(0, su)
+            self.W_uv.weight.imag.normal_(0, su)
+            self.W_vu.weight.real.normal_(0, sv)
+            self.W_vu.weight.imag.normal_(0, sv)
+
+    def decay_u(self):  
+        return F.softplus(self.raw_decay_u) + self.decay_floor  # shape (1,)
+
+    def decay_v(self):
+        return F.softplus(self.raw_decay_v) + self.decay_floor  # shape (m,)
+
+    def w_gain(self):
+        g = F.softplus(self.raw_w_gain)
+
+        if not self.use_gain_clamp:
+            return g
+
+        # Simple norm-based clamp:
+        # g^2 * ||W_uv|| * ||W_vu|| < min(Du) * min(Dv) * margin
+        Du_min = self.decay_u().min()
+        Dv_min = self.decay_v().min()
+
+        # NOTE: computed without grad (hard constraint)
+        with torch.no_grad():
+            norm_uv = torch.linalg.norm(self.W_uv.weight)
+            norm_vu = torch.linalg.norm(self.W_vu.weight)
+
+        max_g2 = (Du_min * Dv_min * self.stability_margin) / (norm_uv * norm_vu + 1e-8)
+        max_g = torch.sqrt(torch.clamp(max_g2, min=0.0))
+        return torch.minimum(g, max_g)
+
+    # ------------------------
+    # activation (paper assumption)
+    # ------------------------
+    @staticmethod
+    def split_tanh(z: torch.Tensor) -> torch.Tensor:
+        return torch.complex(torch.tanh(z.real), torch.tanh(z.imag))
+
+    # ------------------------
+    # one dynamics step
+    # ------------------------
+    def dynamics_step(self, u: torch.Tensor, v: torch.Tensor, x_t: torch.Tensor):
+        """
+        u: [B,1] complex
+        v: [B,m] complex
+        x_t: [B,1] complex (external input at time t)
+        """
+        Du = self.decay_u()  # [1]
+        Dv = self.decay_v()  # [m]
+        g = self.w_gain()    # scalar
+
+        fu = self.split_tanh(u)
+        fv = self.split_tanh(v)
+
+        du = -Du * u + g * self.W_vu(fv) + x_t
+        dv = -Dv * v + g * self.W_uv(fu)
+
+        u_new = u + self.dt * du
+        v_new = v + self.dt * dv
+        return u_new, v_new
+
+    # ------------------------
+    # forward
+    # ------------------------
+    def forward(self, noisy_iq: torch.Tensor, v0: torch.Tensor | None = None):
+        """
+        noisy_iq: [B,T] or [B,T,1] complex (torch.cfloat)
+        returns : same shape
+        """
+        if noisy_iq.dtype != torch.cfloat and noisy_iq.dtype != torch.cdouble:
+            raise TypeError("noisy_iq must be complex (torch.cfloat or torch.cdouble).")
+
+        squeeze_last = False
+        if noisy_iq.dim() == 2:
+            # [B,T] -> [B,T,1]
+            noisy_iq = noisy_iq.unsqueeze(-1)
+            squeeze_last = True
+        elif noisy_iq.dim() == 3 and noisy_iq.size(-1) == 1:
+            pass
+        else:
+            raise ValueError("Expected noisy_iq shape [B,T] or [B,T,1].")
+
+        B, T, _ = noisy_iq.shape
+        device = noisy_iq.device
+        dtype = noisy_iq.dtype
+
+        u = torch.zeros(B, 1, dtype=dtype, device=device)
+        v = torch.zeros(B, self.m, dtype=dtype, device=device) if v0 is None else v0.to(device=device, dtype=dtype)
+
+        outs = []
+        for t in range(T):
+            x_t = noisy_iq[:, t, :]  # [B,1]
+
+            # initialize u near current input (helps convergence early)
+            u = x_t
+
+            # inner convergence loop
+            for s in range(self.steps):
+                u, v = self.dynamics_step(u, v, x_t)
+
+                # anchor to input to prevent drift / preserve information
+                if self.anchor_strength > 0:
+                    # optionally decay anchor during steps
+                    a = self.anchor_strength * (1.0 - (s / max(1, self.steps)))
+                    u = (1 - a) * u + a * x_t
+
+            outs.append(u)
+
+        out = torch.stack(outs, dim=1)  # [B,T,1]
+        return out.squeeze(-1) if squeeze_last else out
+
+    @torch.no_grad()
+    def stability_info(self):
+        Du_min = self.decay_u().min().item()
+        Dv_min = self.decay_v().min().item()
+        g = self.w_gain().item()
+        norm_uv = torch.linalg.norm(self.W_uv.weight).item()
+        norm_vu = torch.linalg.norm(self.W_vu.weight).item()
+        lhs = (g ** 2) * norm_uv * norm_vu
+        rhs = Du_min * Dv_min
+        return {
+            "is_stable_like": lhs < rhs,
+            "stability_ratio(lhs/rhs)": lhs / (rhs + 1e-12),
+            "Du_min": Du_min,
+            "Dv_min": Dv_min,
+            "g": g,
+            "||W_uv||": norm_uv,
+            "||W_vu||": norm_vu,
+        }
 # # --------------------------
 # # U-NET (small, configurable)
 # # --------------------------

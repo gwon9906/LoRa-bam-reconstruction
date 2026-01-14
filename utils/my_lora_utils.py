@@ -125,35 +125,48 @@ def estimate_symbol(a, title, tresshold=0):
 import numpy as np
 
 def estimate_symbol_custom(a, sf, fs, bw):
-    # 1. 기본 설정
-    num_symbols = 2 ** sf  # 512
-    
-    # 2. Dechirp (기존과 동일)
+    """Estimate LoRa symbol index via dechirp + FFT.
+
+    Notes:
+    - This function assumes `a` contains (approximately) one LoRa symbol.
+    - If `fs/bw` > 1 (OSF), the FFT bins are folded by OSF **in power**.
+    """
+    num_symbols = 2 ** sf
     signal_len = len(a)
+
+    if signal_len < num_symbols:
+        raise ValueError(f"Signal too short: len(a)={signal_len} < 2**sf={num_symbols}")
+
+    # If length isn't an integer multiple of 2**sf, truncate to the nearest multiple.
+    if signal_len % num_symbols != 0:
+        new_len = (signal_len // num_symbols) * num_symbols
+        if new_len <= 0:
+            raise ValueError(f"Invalid signal length: len(a)={signal_len}")
+        a = a[:new_len]
+        signal_len = new_len
+
+    osf = signal_len // num_symbols
+
+    # Dechirp
     t = np.arange(signal_len) / fs
     f0 = -bw / 2
     symbol_time = num_symbols / bw
-    
-    # Down Chirp 생성
     phase = 2 * np.pi * (f0 * t + (bw / (2 * symbol_time)) * t**2)
     down_chirp = np.conj(np.exp(1j * phase))
-    
+
     dechirped = a * down_chirp
     spectrum = np.fft.fft(dechirped)
-    
-    # 앞쪽 512개 (양수 대역)
-    pos_freq = spectrum[:num_symbols]
-    
-    # 뒤쪽 512개 (음수 대역)
-    neg_freq = spectrum[-num_symbols:]
-    
-    folded_spectrum = pos_freq + neg_freq
-    
-    # 파워 계산 및 최대값 찾기
-    power = np.abs(folded_spectrum) ** 2
-    symbol = np.argmax(power)
-    peak_power = power[symbol]
-    
+    power = np.abs(spectrum) ** 2
+
+    if osf > 1:
+        folded_power = power.reshape(osf, num_symbols).sum(axis=0)
+        symbol = int(np.argmax(folded_power))
+        peak_power = float(folded_power[symbol])
+    else:
+        valid_power = power[:num_symbols]
+        symbol = int(np.argmax(valid_power))
+        peak_power = float(valid_power[symbol])
+
     return symbol, peak_power
 
     
